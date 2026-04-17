@@ -10,7 +10,7 @@ Or to run automated test scenarios:
     python test_agent.py
 """
 
-from agent import CoachingAgent
+from coaching_agent import CoachingAgent
 
 if __name__ == "__main__":
     agent = CoachingAgent()

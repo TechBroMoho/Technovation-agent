@@ -11,8 +11,8 @@ from dotenv import load_dotenv
 from langchain.tools import tool
 from zoneinfo import ZoneInfo
 
-from database import get_coach
-from cal_com import fetch_available_slots, create_booking
+from coaching_agent.database import get_coach
+from coaching_agent.cal_com import fetch_available_slots, create_booking
 
 load_dotenv()
 

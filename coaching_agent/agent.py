@@ -19,13 +19,14 @@ Architecture:
 """
 
 import os
+import uuid
 from dotenv import load_dotenv
 
 from langchain_anthropic import ChatAnthropic
 from langgraph.prebuilt import create_react_agent
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from tools import get_available_slots, book_slot
+from coaching_agent.tools import get_available_slots, book_slot
 
 # Load API key from .env
 load_dotenv()
@@ -87,7 +88,6 @@ react_agent = create_react_agent(
 class CoachingAgent:
     def __init__(self):
         self.chat_history = []
-        print("Coaching Scheduling Agent ready. Type 'quit' to exit.\n")
 
     def respond(self, user_input: str) -> str:
         self.chat_history.append(HumanMessage(content=user_input))
@@ -114,6 +114,7 @@ class CoachingAgent:
         return response_text
 
     def run_interactive(self):
+        print("Coaching Scheduling Agent ready. Type 'quit' to exit.\n")
         while True:
             try:
                 user_input = input("You: ").strip()
@@ -131,6 +132,27 @@ class CoachingAgent:
             print(f"\nAgent: {response}\n")
 
 
-if __name__ == "__main__":
-    agent = CoachingAgent()
-    agent.run_interactive()
+# ---------------------------------------------------------------------------
+# Multi-session manager
+# ---------------------------------------------------------------------------
+
+class SessionManager:
+    """Manages multiple CoachingAgent instances keyed by session ID."""
+
+    def __init__(self):
+        self._sessions: dict[str, CoachingAgent] = {}
+
+    def get_or_create(self, session_id: str) -> CoachingAgent:
+        if session_id not in self._sessions:
+            self._sessions[session_id] = CoachingAgent()
+        return self._sessions[session_id]
+
+    def respond(self, session_id: str, user_input: str) -> str:
+        agent = self.get_or_create(session_id)
+        return agent.respond(user_input)
+
+    def delete(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+
+    def list_sessions(self) -> list[str]:
+        return list(self._sessions.keys())

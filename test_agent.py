@@ -9,7 +9,7 @@ Requires:
 Run with: python test_agent.py
 """
 
-from agent import CoachingAgent
+from coaching_agent import CoachingAgent
 
 
 def run_scenario(title: str, conversation: list[str]):

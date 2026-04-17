@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coaching-agent"
+version = "0.1.0"
+description = "LangGraph coaching scheduling agent with Cal.com integration"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain",
+    "langchain-anthropic",
+    "langgraph",
+    "langchain-core",
+    "python-dotenv",
+    "psycopg2-binary",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
