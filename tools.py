@@ -1,40 +1,86 @@
 """
 tools.py — LangChain tools for the coaching scheduling agent.
 
-Uses the @tool decorator so LangChain can pass these directly to the LLM
-for real tool-calling (the LLM decides when and how to invoke them).
+Uses real Cal.com API for slot discovery/booking and PostgreSQL for coach info.
 """
 
+import os
 from datetime import datetime, timedelta
+
+from dotenv import load_dotenv
 from langchain.tools import tool
+from zoneinfo import ZoneInfo
 
-# ---------------------------------------------------------------------------
-# Mock "database"
-# ---------------------------------------------------------------------------
+from database import get_coach
+from cal_com import fetch_available_slots, create_booking
 
-BOOKED_SLOTS = {"Tue 2PM", "Wed 10AM"}
+load_dotenv()
 
-COACH_SCHEDULE = {
-    "Mon": ["10AM", "11AM", "2PM", "3PM"],
-    "Tue": ["9AM", "2PM", "3PM", "4PM"],
-    "Wed": ["10AM", "1PM", "3PM"],
-    "Thu": ["9AM", "11AM", "2PM", "4PM"],
-    "Fri": ["10AM", "12PM", "2PM"],
-}
+# Attendee info loaded once from environment
+ATTENDEE_NAME = os.getenv("ATTENDEE_NAME", "Student")
+ATTENDEE_EMAIL = os.getenv("ATTENDEE_EMAIL", "")
+ATTENDEE_TIMEZONE = os.getenv("ATTENDEE_TIMEZONE", "America/New_York")
 
-# Coach-specific scheduling preferences.
-# Each coach can express a preferred time-of-day or specific hourly blocks.
-COACH_PREFERENCES = {
-    "default": {
-        "time_of_day": "morning",          # "morning", "afternoon", or None
-        "preferred_hours": ["10AM", "11AM"],  # specific slots the coach prefers
-    },
-}
+# Cal.com event defaults (not stored in DB yet)
+DEFAULT_EVENT_SLUG = os.getenv("CAL_EVENT_SLUG", "coaching-session")
+DEFAULT_EVENT_TYPE_ID = int(os.getenv("CAL_EVENT_TYPE_ID", "0"))
 
 
-def _day_label(offset: int) -> str:
-    target = datetime.now() + timedelta(days=offset)
-    return target.strftime("%a")
+def _resolve_day(day: str) -> tuple[str, str]:
+    """
+    Turn a human day reference into an ISO date window (start, end).
+
+    Accepts: 'today', 'tomorrow', a weekday name like 'Tuesday',
+    or an ISO date like '2026-04-10'.
+
+    Returns (start_iso, end_iso) — both in UTC with Z suffix.
+    Uses the attendee timezone so that 'today'/'tomorrow' match the user's local date.
+    """
+    day_clean = day.strip().lower()
+    tz = ZoneInfo(ATTENDEE_TIMEZONE)
+    now = datetime.now(tz)
+
+    if day_clean == "today":
+        target = now
+    elif day_clean == "tomorrow":
+        target = now + timedelta(days=1)
+    else:
+        # Try ISO date first
+        try:
+            target = datetime.fromisoformat(day_clean)
+        except ValueError:
+            # Weekday name — find next occurrence
+            weekdays = {
+                "monday": 0, "tuesday": 1, "wednesday": 2,
+                "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
+            }
+            target_wd = weekdays.get(day_clean)
+            if target_wd is None:
+                # Try 3-letter abbreviation
+                abbrevs = {
+                    "mon": 0, "tue": 1, "wed": 2, "thu": 3,
+                    "fri": 4, "sat": 5, "sun": 6,
+                }
+                target_wd = abbrevs.get(day_clean[:3])
+            if target_wd is None:
+                target = now
+            else:
+                days_ahead = (target_wd - now.weekday()) % 7
+                target = now + timedelta(days=days_ahead)
+
+    # Build start-of-day and end-of-day in the user's local timezone,
+    # then convert to UTC so the Cal.com query window matches the user's actual day.
+    local_start = target.replace(hour=0, minute=0, second=0, microsecond=0)
+    if local_start.tzinfo is None:
+        local_start = local_start.replace(tzinfo=tz)
+    local_end = local_start + timedelta(days=1) - timedelta(seconds=1)
+
+    utc_start = local_start.astimezone(ZoneInfo("UTC"))
+    utc_end = local_end.astimezone(ZoneInfo("UTC"))
+
+    start = utc_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end = utc_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return start, end
 
 
 # ---------------------------------------------------------------------------
@@ -42,127 +88,98 @@ def _day_label(offset: int) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
-def get_available_slots(day: str, time_of_day: str = "any", preferences: str = "") -> str:
+def get_available_slots(day: str, coach_name: str = "") -> str:
     """
-    Get available coaching slots for a given day.
+    Get available coaching slots for a given day from Cal.com.
     Use this when the user asks about availability or open times.
 
-    IMPORTANT: If a coach has specific scheduling preferences (e.g. they prefer
-    morning sessions or certain hourly blocks), pass those preferences so the
-    returned list is sorted with the coach's preferred slots FIRST. Always
-    prioritize any slots that match the coach's preference metadata — present
-    those at the top of the list so the user naturally gravitates toward them.
-
     Args:
-        day: The day to check. Use 'today', 'tomorrow', or a weekday name
-             like 'Tuesday'.
-        time_of_day: Filter by 'morning', 'afternoon', or 'any'.
-        preferences: Optional — a coach name key (e.g. 'default') OR a
-                     comma-separated list of preferred hours (e.g.
-                     '10AM,11AM') OR a JSON dict string with keys
-                     'time_of_day' and/or 'preferred_hours'. When provided,
-                     matching slots are listed first in the results.
+        day: The day to check. Use 'today', 'tomorrow', a weekday name
+             like 'Tuesday', or an ISO date like '2026-04-10'.
+        coach_name: Optional coach name. If omitted, uses the default coach.
 
     Returns:
-        A formatted string listing available slots (preferred slots listed
-        first), or a message if none are found.
+        A formatted string listing available ISO 8601 time slots, or an error message.
     """
-    import json as _json
+    coach = get_coach(coach_name if coach_name else None)
+    if not coach:
+        return "Error: No coach found in the database. Please check your setup."
 
-    day_clean = day.strip().lower()
-    if day_clean == "today":
-        label = _day_label(0)
-    elif day_clean == "tomorrow":
-        label = _day_label(1)
-    else:
-        label = day_clean[:3].capitalize()
+    start, end = _resolve_day(day)
 
-    raw_slots = COACH_SCHEDULE.get(label, [])
+    result = fetch_available_slots(
+        event_type_id=DEFAULT_EVENT_TYPE_ID,
+        start_time=start,
+        end_time=end,
+    )
 
-    def is_morning(t):   return "AM" in t
-    def is_afternoon(t): return "PM" in t
+    if "error" in result:
+        return f"Error fetching availability: {result['error']}"
 
-    if time_of_day == "morning":
-        raw_slots = [t for t in raw_slots if is_morning(t)]
-    elif time_of_day == "afternoon":
-        raw_slots = [t for t in raw_slots if is_afternoon(t)]
+    # Flatten all slots, converting UTC to the attendee's local timezone.
+    tz = ZoneInfo(ATTENDEE_TIMEZONE)
+    tz_abbrev = datetime.now(tz).strftime("%Z")
+    all_slots = []
+    for date_key, times in result.get("slots", {}).items():
+        if isinstance(times, list):
+            for slot in times:
+                utc_str = slot.get("start", "") if isinstance(slot, dict) else slot
+                if not utc_str:
+                    continue
+                utc_dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+                local_dt = utc_dt.astimezone(tz)
+                local_label = local_dt.strftime("%I:%M %p").lstrip("0")
+                # Include both local time and UTC so the LLM can display local
+                # but still pass the exact UTC string to book_slot.
+                all_slots.append(f"{local_label} {tz_abbrev} (UTC: {utc_str})")
 
-    available = [f"{label} {t}" for t in raw_slots if f"{label} {t}" not in BOOKED_SLOTS]
+    if not all_slots:
+        return f"No available slots found for {day}."
 
-    if not available:
-        return f"No available slots found for {day} ({time_of_day})."
-
-    # --- resolve preference metadata ---
-    pref_hours: list[str] = []
-    pref_tod: str | None = None
-
-    if preferences:
-        pref_str = preferences.strip()
-        # 1) Check if it's a known coach key
-        if pref_str in COACH_PREFERENCES:
-            pref_data = COACH_PREFERENCES[pref_str]
-            pref_hours = pref_data.get("preferred_hours", [])
-            pref_tod = pref_data.get("time_of_day")
-        else:
-            # 2) Try JSON dict
-            try:
-                pref_data = _json.loads(pref_str)
-                if isinstance(pref_data, dict):
-                    pref_hours = pref_data.get("preferred_hours", [])
-                    pref_tod = pref_data.get("time_of_day")
-            except (_json.JSONDecodeError, TypeError):
-                # 3) Treat as comma-separated hour list
-                pref_hours = [h.strip() for h in pref_str.split(",") if h.strip()]
-
-    # Build a set of preferred time strings for fast lookup
-    preferred_set: set[str] = set()
-    for slot in available:
-        _, t = slot.split(" ", 1)
-        if t in pref_hours:
-            preferred_set.add(slot)
-        elif pref_tod == "morning" and is_morning(t):
-            preferred_set.add(slot)
-        elif pref_tod == "afternoon" and is_afternoon(t):
-            preferred_set.add(slot)
-
-    # Sort: preferred slots first, then the rest
-    preferred = [s for s in available if s in preferred_set]
-    others = [s for s in available if s not in preferred_set]
-    sorted_available = preferred + others
-
-    if preferred:
-        pref_label = ", ".join(preferred)
-        other_label = ", ".join(others) if others else "none"
-        return (
-            f"Available slots for {day} (preferred first): {pref_label}"
-            + (f" | Other slots: {other_label}" if others else "")
-        )
-
-    return f"Available slots for {day}: {', '.join(sorted_available)}"
+    return f"Available slots for {day}:\n" + "\n".join(all_slots)
 
 
 @tool
-def book_slot(slot: str) -> str:
+def book_slot(slot_time: str, coach_name: str = "") -> str:
     """
-    Book a specific coaching slot.
+    Book a specific coaching slot via Cal.com.
     Use this when the user has chosen a slot and wants to confirm a booking.
 
     Args:
-        slot: The slot to book, in the format 'Day Time' e.g. 'Tue 3PM'.
+        slot_time: The ISO 8601 timestamp of the slot to book
+                   (e.g. '2026-04-10T10:00:00Z'). Use the exact timestamp
+                   from get_available_slots results.
+        coach_name: Optional coach name. If omitted, uses the default coach.
 
     Returns:
-        A confirmation message or an error if the slot is unavailable.
+        A confirmation message or an error if the booking fails.
     """
-    if slot in BOOKED_SLOTS:
-        return f"Sorry, '{slot}' is already booked. Please choose another slot."
+    coach = get_coach(coach_name if coach_name else None)
+    if not coach:
+        return "Error: No coach found in the database. Please check your setup."
 
-    parts = slot.strip().split()
-    if len(parts) != 2:
-        return f"Invalid slot format: '{slot}'. Please use format like 'Tue 3PM'."
+    username = coach["calcom_username"]
+    event_slug = DEFAULT_EVENT_SLUG
+    event_type_id = DEFAULT_EVENT_TYPE_ID
 
-    day, time = parts
-    if time not in COACH_SCHEDULE.get(day, []):
-        return f"'{slot}' is not a valid coaching time. Please pick from available slots."
+    if not event_type_id:
+        return "Error: CAL_EVENT_TYPE_ID is not set in .env. Please configure it."
 
-    BOOKED_SLOTS.add(slot)
-    return f"✅ Booked! You're confirmed for {slot}. You'll receive a calendar invite shortly."
+    result = create_booking(
+        start_time=slot_time,
+        event_type_id=event_type_id,
+        event_type_slug=event_slug,
+        username=username,
+        attendee_name=ATTENDEE_NAME,
+        attendee_email=ATTENDEE_EMAIL,
+        attendee_timezone=ATTENDEE_TIMEZONE,
+    )
+
+    if isinstance(result, dict) and "error" in result:
+        return f"Booking failed: {result['error']}"
+
+    booking_id = result.get("id", result.get("uid", "unknown"))
+    return (
+        f"Booked! Your coaching session at {slot_time} is confirmed. "
+        f"Booking ID: {booking_id}. You'll receive a calendar invite at {ATTENDEE_EMAIL}."
+    )

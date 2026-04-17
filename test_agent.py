@@ -1,11 +1,16 @@
 """
-test_agent.py — Demo conversations for the real LangChain agent.
+test_agent.py — Demo conversations for the coaching scheduling agent.
 
-Requires a valid ANTHROPIC_API_KEY in your .env file.
+Requires:
+  - Valid ANTHROPIC_API_KEY in .env
+  - PostgreSQL running with coaches table populated
+  - Valid CAL_COM_API_KEY in .env
+
 Run with: python test_agent.py
 """
 
 from agent import CoachingAgent
+
 
 def run_scenario(title: str, conversation: list[str]):
     print(f"\n{'='*60}")
@@ -23,11 +28,11 @@ def run_scenario(title: str, conversation: list[str]):
 
 if __name__ == "__main__":
 
-    # Assignment spec example
+    # Basic availability check and booking
     run_scenario(
-        "Assignment Spec Flow",
+        "Check Availability and Book",
         [
-            "Find me available coaching times tomorrow afternoon",
+            "What coaching slots are available tomorrow?",
             "Book the first one",
         ]
     )
@@ -37,7 +42,7 @@ if __name__ == "__main__":
         "Vague Follow-ups",
         [
             "Do you have anything on Thursday?",
-            "What about just the morning?",
+            "What about just the morning slots?",
             "Book the second one",
         ]
     )

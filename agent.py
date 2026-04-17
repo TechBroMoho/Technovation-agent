@@ -1,30 +1,29 @@
 """
-agent.py — Real LangChain agent using Claude (via ChatAnthropic).
+agent.py — LangGraph agent using Claude (via ChatAnthropic).
 
 The LLM genuinely reasons about which tools to call and when —
-no regex or hardcoded intent parsing. This is the real LangChain pattern.
+no regex or hardcoded intent parsing.
 
 Architecture:
     User input
-        ↓
+        |
     ChatAnthropic (Claude) — reasons about what to do
-        ↓
+        |
     Tool call (get_available_slots or book_slot)
-        ↓
+        |
     Tool result fed back to Claude
-        ↓
+        |
     Claude formats final response
-        ↓
-    AgentExecutor returns to user
+        |
+    Agent returns to user
 """
 
 import os
 from dotenv import load_dotenv
 
 from langchain_anthropic import ChatAnthropic
-from langchain.agents import AgentExecutor, create_tool_calling_agent
-from langchain.memory import ConversationBufferMemory
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langgraph.prebuilt import create_react_agent
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from tools import get_available_slots, book_slot
 
@@ -48,19 +47,17 @@ llm = ChatAnthropic(
 tools = [get_available_slots, book_slot]
 
 # ---------------------------------------------------------------------------
-# Prompt
+# System prompt
 # ---------------------------------------------------------------------------
 
-prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """You are a helpful coaching session scheduling assistant.
+SYSTEM_PROMPT = """You are a helpful coaching session scheduling assistant.
 Your job is to help users find and book available coaching time slots.
 
-Coach preference context:
-  The coach prefers morning sessions, especially the 10 AM and 11 AM slots.
-  When showing available times, always pass preferences='default' to the
-  get_available_slots tool so preferred slots appear first.
+How it works:
+  - The get_available_slots tool returns real availability from Cal.com.
+  - Slots are returned as ISO 8601 timestamps (e.g. 2026-04-10T10:00:00Z).
+  - Coach-preferred times are listed first in the results.
+  - When booking, pass the exact ISO timestamp from the slot listing to book_slot.
 
 Guidelines:
 - Always check availability before booking
@@ -68,37 +65,19 @@ Guidelines:
 - Be concise and friendly
 - If a user says 'the first one' or 'that one', refer back to the slots you just listed
 - Only book slots the user explicitly confirms
-- When presenting slots, gently nudge the user toward the coach's preferred
-  times (the ones listed first in the tool results). For example you might say
-  "The coach's favorite slots are …" or "The coach especially recommends …".
-  Never refuse other times — just highlight the preferred ones first."""
-    ),
-    MessagesPlaceholder(variable_name="chat_history"),
-    ("human", "{input}"),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
+- When presenting slots, convert ISO timestamps to a human-friendly format
+  (e.g. "10:00 AM PT") but keep the original ISO timestamp for booking
+- When slots are labeled as "coach-preferred", gently nudge the user toward those
+- If a tool returns an error, explain it clearly and suggest the user try again"""
 
 # ---------------------------------------------------------------------------
-# Memory
+# Agent (LangGraph)
 # ---------------------------------------------------------------------------
 
-memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    return_messages=True,
-)
-
-# ---------------------------------------------------------------------------
-# Agent + Executor
-# ---------------------------------------------------------------------------
-
-agent = create_tool_calling_agent(llm=llm, tools=tools, prompt=prompt)
-
-agent_executor = AgentExecutor(
-    agent=agent,
+react_agent = create_react_agent(
+    model=llm,
     tools=tools,
-    memory=memory,
-    verbose=True,
-    handle_parsing_errors=True,
+    prompt=SYSTEM_PROMPT,
 )
 
 # ---------------------------------------------------------------------------
@@ -107,14 +86,32 @@ agent_executor = AgentExecutor(
 
 class CoachingAgent:
     def __init__(self):
+        self.chat_history = []
         print("Coaching Scheduling Agent ready. Type 'quit' to exit.\n")
 
     def respond(self, user_input: str) -> str:
-        result = agent_executor.invoke({"input": user_input})
-        output = result["output"]
-        if isinstance(output, list):
-            return " ".join(item.get("text", "") for item in output if isinstance(item, dict))
-        return output
+        self.chat_history.append(HumanMessage(content=user_input))
+
+        result = react_agent.invoke({"messages": self.chat_history})
+
+        # The last message in the result is the AI response
+        ai_messages = result["messages"]
+        # Find the last AI text message
+        response_text = ""
+        for msg in reversed(ai_messages):
+            if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content.strip():
+                response_text = msg.content
+                break
+            elif hasattr(msg, "content") and isinstance(msg.content, list):
+                texts = [block.get("text", "") for block in msg.content if isinstance(block, dict) and "text" in block]
+                if texts:
+                    response_text = " ".join(texts)
+                    break
+
+        # Update history with full conversation
+        self.chat_history = ai_messages
+
+        return response_text
 
     def run_interactive(self):
         while True:
@@ -126,9 +123,14 @@ class CoachingAgent:
 
             if not user_input:
                 continue
-            if user_input.lower() in ("quit", "exit", "bye"):
+            if user_input.lower() in ("quit", "exit", "bye", "q"):
                 print("Agent: Goodbye! Good luck with your sessions.")
                 break
 
             response = self.respond(user_input)
             print(f"\nAgent: {response}\n")
+
+
+if __name__ == "__main__":
+    agent = CoachingAgent()
+    agent.run_interactive()
