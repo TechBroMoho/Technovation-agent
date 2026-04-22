@@ -232,9 +232,3 @@ class SessionManager:
 
     def list_sessions(self) -> List[str]:
         return list(self._sessions.keys())
-    def get_role(self, session_id: str) -> str:
-    """Return the detected role for this session: coach, participant, or unknown"""
-    session = self.sessions.get(session_id)
-    if not session:
-        return "unknown"
-    return session.get("role", "unknown")
