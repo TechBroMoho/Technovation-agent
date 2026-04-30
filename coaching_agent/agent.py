@@ -22,7 +22,7 @@ load_dotenv()
 # ── LLM ───────────────────────────────────────────────────────────────
 llm = ChatAnthropic(
     model="claude-haiku-4-5-20251001",
-    api_key=str(os.getenv("ANTHROPIC_API_KEY")),
+    anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
     temperature=0,
 )
 
